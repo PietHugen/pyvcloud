@@ -207,6 +207,11 @@ class BasicLoginCredentials(object):
         self.org = org
         self.password = password
 
+class TokenLogin(object):
+    def __init__(self,token,org):
+        self.token = token
+        self.org = org
+
 
 class RelationType(Enum):
     ADD = 'add'
@@ -772,6 +777,15 @@ class Client(object):
 
     _UPLOAD_FRAGMENT_MAX_RETRIES = 5
 
+
+    def _prep_real_base_uri(self, uri):
+        result = uri
+        if len(result) > 0:
+            if result[-1] != '/':
+                result += '/'
+            if not result.startswith('https://') and not result.startswith('http://'):  # noqa: E501
+                result = 'https://' + result
+        return result
     def _prep_base_uri(self, uri, is_cloudapi=False):
         result = uri
         if len(result) > 0:
@@ -806,6 +820,7 @@ class Client(object):
         self.fsencoding = sys.getfilesystemencoding()
 
         self._api_base_uri = self._prep_base_uri(uri)
+        self._base_uri = self._prep_real_base_uri(uri)
         self._cloudapi_base_uri = self._prep_base_uri(uri, True)
         self._api_version = api_version
         self._vcd_api_version = None
@@ -1003,6 +1018,87 @@ class Client(object):
         self._logger.debug('API versions supported: %s' % active_versions)
         self._logger.debug('API version set to: %s' % self._api_version)
         return self._api_version
+
+    def set_token(self, tokencreds):
+        """Set credentials and authenticate to create a new session.
+
+        This call will automatically negotiate the server API version if
+        it was not set previously. The auto-negotiated API version cannot be
+        a pre-release version. Note that the method may generate
+        exceptions from the underlying socket connection, which we pass
+        up unchanged to the client.
+
+        :param Tokenlogin: Credentials containing org,
+             and api token (generated in vcd portal).
+
+        :raises: VcdException: if automatic API negotiation fails to arrive
+            at a supported client version
+        """
+        self._negotiate_api_version()
+        self._logger.debug('API version in use: %s' % self._api_version)
+
+        # Ensure we close session if any exception is thrown to avoid leaking
+        # a socket connection.
+        new_session = requests.Session()
+        try:
+            print(f"{tokencreds.org} and {tokencreds.token}")
+            print(f"apiversion {self._api_version}")
+            # Use /cloudapi/1.0.0/sessions for Xendi and beyond i.e. api v33+
+            # otherwise use /api/sessions
+            if int(self._api_version.split('.')[0]) >= 36: 
+                accept_type = 'application/json'
+                uri = self._base_uri + 'oauth/tenant/' + tokencreds.org.upper() + '/token?grant_type=refresh_token&refresh_token=' + tokencreds.token
+                print(f"uri is {uri}")
+
+            response = self._do_request_prim(
+                'POST',
+                uri,
+                new_session,
+                accept_type=accept_type)
+            print(f"{response.status_code} token: ${response.content}")
+
+            sc = response.status_code
+            if sc != requests.codes.ok:
+                raise VcdException('Login failed.')
+
+            access_token = response.json()['access_token']
+            print(f"{access_token}")
+            if access_token is None:
+                raise VcdException('No access token received')
+            # A new session will be created in rehydrate and stored in
+            # this object
+            new_session.close()
+
+            # build the real session
+
+            new_session = requests.Session()
+            uri = self._base_uri + 'api/session'
+            print(f"uri is {uri}")
+            headers = {
+                # "Accept": "Application/*+xml;version=36.1",
+                "Authorization": f"Bearer {access_token}"
+            }
+            print(f"headers: {headers}")
+            response = self._do_request_prim(method='GET',uri=uri, session=new_session, extra_headers=headers )
+            print(response)
+            sc = response.status_code
+            if sc != requests.codes.ok: 
+                raise VcdException('error getting session from acces token')
+            
+            self._session = new_session
+            self._vcloud_auth_token = \
+                response.headers[self._HEADER_X_VCLOUD_AUTH_NAME]
+            self._session.headers[self._HEADER_X_VCLOUD_AUTH_NAME] = \
+                self._vcloud_auth_token
+            self._vcloud_session = objectify.fromstring(response.content)
+            self._update_is_sysadmin()
+            self._session_endpoints = \
+                _get_session_endpoints(self._vcloud_session)
+
+        except:
+            raise VcdException('something wrong')
+
+
 
     def set_credentials(self, creds):
         """Set credentials and authenticate to create a new session.
